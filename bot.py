@@ -6,7 +6,6 @@ import asyncio
 import os
 import shutil
 from dotenv import load_dotenv
-import re
 
 # Check for FFmpeg
 def check_ffmpeg():
@@ -46,40 +45,48 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix='/', intents=intents)
 
-# yt-dlp options for audio extraction
+# Optimized yt-dlp options for Raspberry Pi Zero 2W
+# Lower quality = less CPU usage and bandwidth
 ytdl_format_options = {
-    # High quality audio format selection
-    # Prioritizes: Opus > M4A/AAC > WebM > MP3
-    'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+    # Optimized format selection for low-power devices
+    # Prefer opus (most efficient) > m4a > lower quality audio
+    'format': 'bestaudio[ext=opus]/bestaudio[ext=m4a]/worstaudio/bestaudio',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
-    'noplaylist': True,  # Set to False to enable playlist support
+    'noplaylist': True,
     'nocheckcertificate': True,
     'ignoreerrors': False,
     'logtostderr': False,
     'quiet': True,
     'no_warnings': True,
-    'default_search': 'ytsearch',  # Changed to auto-search YouTube
+    'default_search': 'ytsearch',
     'source_address': '0.0.0.0',
-    # Additional quality settings
     'prefer_ffmpeg': True,
     'keepvideo': False,
+    # Lighter postprocessing for Pi Zero
     'postprocessors': [{
         'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'best',
+        'preferredcodec': 'opus',  # Opus is lighter than mp3
+        'preferredquality': '96',   # Lower quality = less CPU (was default ~192)
     }],
+    # Additional optimizations
+    'concurrent_fragment_downloads': 1,  # Reduce parallel downloads
+    'buffersize': 4096,  # Smaller buffer
+    'http_chunk_size': 1048576,  # 1MB chunks (smaller for Pi)
 }
 
 # Separate config for playlist handling
 ytdl_playlist_options = {
     **ytdl_format_options,
-    'noplaylist': False,  # Enable playlist extraction
-    'extract_flat': True,  # Only get URLs, don't download yet
+    'noplaylist': False,
+    'extract_flat': True,  # Don't download metadata for all videos at once
+    'lazy_playlist': True,  # Process playlist items one at a time
 }
 
+# Optimized FFmpeg options for Raspberry Pi Zero 2W
 ffmpeg_options = {
-    'options': '-vn',  # No video
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'  # Better streaming stability
+    'options': '-vn -b:a 96k -ac 2',  # 96kbps, stereo (lower bitrate = less CPU)
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -106,8 +113,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
 # Queue system and playback state
 queues = {}
-loop_state = {}  # Track loop state for each guild
-history = {}  # Track song history for previous button
+loop_state = {}
+history = {}
 
 def get_queue(guild_id):
     if guild_id not in queues:
@@ -125,86 +132,38 @@ def get_history(guild_id):
         history[guild_id] = []
     return history[guild_id]
 
-def is_spotify_url(url):
-    """Check if URL is a Spotify link"""
-    spotify_patterns = [
-        r'https?://open\.spotify\.com/track/',
-        r'https?://open\.spotify\.com/album/',
-        r'https?://open\.spotify\.com/playlist/',
-    ]
-    return any(re.match(pattern, url) for pattern in spotify_patterns)
-
 def is_youtube_playlist(url):
     """Check if URL is a YouTube playlist (not a single video from a playlist)"""
-    # Check if it's a playlist URL
     if 'list=' not in url or 'youtube.com' not in url:
         return False
     
-    # If it has a video ID (v=), it's a single video from a playlist, not the full playlist
     if 'v=' in url or '/watch?' in url:
         return False
     
-    # If it's specifically a playlist URL
     if '/playlist?' in url:
         return True
     
     return False
 
-async def get_spotify_info(url):
-    """Extract Spotify track info and search on YouTube"""
-    loop = asyncio.get_event_loop()
-    
-    try:
-        # Extract info from Spotify URL (yt-dlp can get metadata)
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
-        
-        if data:
-            # Get track name and artist
-            title = data.get('title', '')
-            artist = data.get('artist', '') or data.get('uploader', '')
-            
-            # Search YouTube for the song
-            search_query = f"{artist} {title}" if artist else title
-            search_result = await loop.run_in_executor(
-                None, 
-                lambda: ytdl.extract_info(f"ytsearch:{search_query}", download=False)
-            )
-            
-            if search_result and 'entries' in search_result and len(search_result['entries']) > 0:
-                # Return the YouTube URL of the first result
-                return search_result['entries'][0]['webpage_url'], f"{artist} - {title}"
-            
-    except Exception as e:
-        print(f"Spotify extraction error: {e}")
-        # If yt-dlp can't handle Spotify, try basic search
-        # Extract track ID and search manually
-        track_match = re.search(r'track/([a-zA-Z0-9]+)', url)
-        if track_match:
-            # Just search the URL on YouTube as fallback
-            search_result = await loop.run_in_executor(
-                None, 
-                lambda: ytdl.extract_info(f"ytsearch:{url}", download=False)
-            )
-            if search_result and 'entries' in search_result:
-                return search_result['entries'][0]['webpage_url'], search_result['entries'][0]['title']
-    
-    return None, None
-
 async def extract_playlist_urls(playlist_url):
-    """Extract all video URLs from a YouTube playlist"""
+    """Extract all video URLs from a YouTube playlist (optimized for Pi)"""
     loop = asyncio.get_event_loop()
     
     try:
+        # Use lazy extraction to reduce memory usage
         data = await loop.run_in_executor(
             None, 
             lambda: ytdl_playlist.extract_info(playlist_url, download=False)
         )
         
         if 'entries' in data:
-            # Extract URLs from playlist
             urls = []
-            for entry in data['entries']:
-                if entry:  # Some entries might be None
+            # Limit playlist size to prevent overwhelming the Pi
+            max_songs = 50  # Safety limit for Pi Zero
+            for i, entry in enumerate(data['entries']):
+                if i >= max_songs:
+                    break
+                if entry:
                     url = entry.get('url') or entry.get('webpage_url') or f"https://www.youtube.com/watch?v={entry.get('id')}"
                     urls.append(url)
             return urls, data.get('title', 'Unknown Playlist')
@@ -228,26 +187,19 @@ class MusicControlView(View):
             await interaction.response.send_message("I'm not in a voice channel!", ephemeral=True)
             return
         
-        if len(song_history) < 2:  # Need at least 2 songs in history (current + previous)
+        if len(song_history) < 2:
             await interaction.response.send_message("No previous song!", ephemeral=True)
             return
         
-        # Remove current song from history
         song_history.pop()
-        
-        # Get previous song
         prev_url = song_history.pop()
         
-        # Add current playing song back to front of queue
         queue = get_queue(self.guild_id)
         if voice_client.is_playing():
             voice_client.stop()
         
-        # Insert previous song at front of queue
         queue.insert(0, prev_url)
-        
-        # Play it
-        voice_client.stop()  # This will trigger play_next
+        voice_client.stop()
         await interaction.response.send_message("⏮️ Playing previous song...", ephemeral=True)
     
     @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.secondary)
@@ -279,12 +231,10 @@ class MusicControlView(View):
     
     @discord.ui.button(label="🔁 Loop: Off", style=discord.ButtonStyle.secondary)
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 1. Logic: Update your internal state
         current_state = get_loop_state(self.guild_id)
         new_state = not current_state
         set_loop_state(self.guild_id, new_state)
         
-        # 2. UI: Change the button appearance
         if new_state:
             button.label = "🔁 Loop: On"
             button.style = discord.ButtonStyle.success
@@ -292,8 +242,6 @@ class MusicControlView(View):
             button.label = "🔁 Loop: Off"
             button.style = discord.ButtonStyle.secondary
         
-        # 3. Response: This acknowledges the click AND updates the UI in one go
-        # This acts as the "resolution" you were looking for.
         await interaction.response.edit_message(view=self)
     
     @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger)
@@ -313,43 +261,28 @@ class MusicControlView(View):
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     print(f'Bot is in {len(bot.guilds)} guilds')
+    print('Optimized for Raspberry Pi Zero 2W - Using 96kbps audio')
     
-    # Sync slash commands
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} command(s)")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
 
-@bot.tree.command(name="play", description="Play a song from YouTube or Spotify")
+@bot.tree.command(name="play", description="Play a song from YouTube")
 async def play(interaction: discord.Interaction, url: str):
-    """Play a song from a YouTube or Spotify URL"""
+    """Play a song from a YouTube URL"""
     
-    # Check if user is in a voice channel
     if not interaction.user.voice:
         await interaction.response.send_message("You need to be in a voice channel to use this command!", ephemeral=True)
         return
     
     channel = interaction.user.voice.channel
-    
-    # Defer the response as processing might take time
     await interaction.response.defer(ephemeral=True)
     
     try:
-        # Handle Spotify URLs
-        if is_spotify_url(url):
-            await interaction.followup.send("🎵 Detected Spotify link! Searching on YouTube...", ephemeral=True)
-            youtube_url, track_name = await get_spotify_info(url)
-            
-            if not youtube_url:
-                await interaction.followup.send("❌ Could not find this Spotify track on YouTube!", ephemeral=True)
-                return
-            
-            url = youtube_url
-            await interaction.followup.send(f"✅ Found: **{track_name}**", ephemeral=True)
-        
         # Handle YouTube playlists
-        elif is_youtube_playlist(url):
+        if is_youtube_playlist(url):
             await interaction.followup.send("📝 Detected playlist! Extracting songs...", ephemeral=True)
             playlist_urls, playlist_name = await extract_playlist_urls(url)
             
@@ -359,16 +292,21 @@ async def play(interaction: discord.Interaction, url: str):
             
             queue = get_queue(interaction.guild.id)
             
-            # Add all songs to queue
             for playlist_url in playlist_urls:
                 queue.append(playlist_url)
             
-            await interaction.followup.send(
-                f"✅ Added **{len(playlist_urls)}** songs from playlist: **{playlist_name}**", 
-                ephemeral=True
-            )
+            # Show warning if playlist was limited
+            if len(playlist_urls) >= 50:
+                await interaction.followup.send(
+                    f"✅ Added **{len(playlist_urls)}** songs (max 50 for Pi performance)\nPlaylist: **{playlist_name}**", 
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"✅ Added **{len(playlist_urls)}** songs from playlist: **{playlist_name}**", 
+                    ephemeral=True
+                )
             
-            # If nothing is playing, start playing the first song
             voice_client = interaction.guild.voice_client
             if voice_client is None:
                 voice_client = await channel.connect()
@@ -376,7 +314,6 @@ async def play(interaction: discord.Interaction, url: str):
                 await voice_client.move_to(channel)
             
             if not voice_client.is_playing():
-                # Pop first song and play it
                 first_url = queue.pop(0)
                 player = await YTDLSource.from_url(first_url, loop=bot.loop, stream=True)
                 
@@ -391,7 +328,7 @@ async def play(interaction: discord.Interaction, url: str):
             
             return
         
-        # Connect to voice channel if not already connected
+        # Connect to voice channel
         if interaction.guild.voice_client is None:
             voice_client = await channel.connect()
         else:
@@ -409,14 +346,12 @@ async def play(interaction: discord.Interaction, url: str):
         # Play the audio
         player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
         
-        # Add to history
         song_history = get_history(interaction.guild.id)
         song_history.append(url)
         
         voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
             play_next(interaction.guild.id, interaction.channel), bot.loop))
         
-        # Send control buttons
         view = MusicControlView(interaction.guild.id)
         await interaction.channel.send(f'Now playing: **{player.title}**', view=view)
         await interaction.followup.send(f'Started playing: **{player.title}**', ephemeral=True)
@@ -429,30 +364,14 @@ async def play(interaction: discord.Interaction, url: str):
 async def play_now(interaction: discord.Interaction, url: str):
     """Play a song immediately, skipping the queue"""
     
-    # Check if user is in a voice channel
     if not interaction.user.voice:
         await interaction.response.send_message("You need to be in a voice channel to use this command!", ephemeral=True)
         return
     
     channel = interaction.user.voice.channel
-    
-    # Defer the response as processing might take time
     await interaction.response.defer(ephemeral=True)
     
     try:
-        # Handle Spotify URLs
-        if is_spotify_url(url):
-            await interaction.followup.send("🎵 Detected Spotify link! Searching on YouTube...", ephemeral=True)
-            youtube_url, track_name = await get_spotify_info(url)
-            
-            if not youtube_url:
-                await interaction.followup.send("❌ Could not find this Spotify track on YouTube!", ephemeral=True)
-                return
-            
-            url = youtube_url
-            await interaction.followup.send(f"✅ Found: **{track_name}**", ephemeral=True)
-        
-        # Connect to voice channel if not already connected
         if interaction.guild.voice_client is None:
             voice_client = await channel.connect()
         else:
@@ -460,21 +379,17 @@ async def play_now(interaction: discord.Interaction, url: str):
             if voice_client.channel != channel:
                 await voice_client.move_to(channel)
         
-        # Stop current playback if any
         if voice_client.is_playing() or voice_client.is_paused():
             voice_client.stop()
         
-        # Play the audio immediately
         player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
         
-        # Add to history
         song_history = get_history(interaction.guild.id)
         song_history.append(url)
         
         voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
             play_next(interaction.guild.id, interaction.channel), bot.loop))
         
-        # Send control buttons
         view = MusicControlView(interaction.guild.id)
         await interaction.channel.send(f'Playing now: **{player.title}**', view=view)
         await interaction.followup.send(f'Started playing immediately: **{player.title}**', ephemeral=True)
@@ -493,7 +408,6 @@ async def play_next(guild_id, channel):
     if get_loop_state(guild_id):
         song_history = get_history(guild_id)
         if song_history:
-            # Replay the last song
             url = song_history[-1]
             try:
                 player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
@@ -511,7 +425,6 @@ async def play_next(guild_id, channel):
     if len(queue) > 0:
         url = queue.pop(0)
         try:
-            # Add to history
             song_history = get_history(guild_id)
             song_history.append(url)
             
@@ -593,7 +506,9 @@ async def show_queue(interaction: discord.Interaction):
     if len(queue) == 0:
         await interaction.response.send_message("The queue is empty!", ephemeral=True)
     else:
-        queue_list = "\n".join([f"{i+1}. {url}" for i, url in enumerate(queue)])
+        queue_list = "\n".join([f"{i+1}. {url}" for i, url in enumerate(queue[:20])])  # Show first 20
+        if len(queue) > 20:
+            queue_list += f"\n... and {len(queue) - 20} more"
         await interaction.response.send_message(f"**Current Queue:**\n{queue_list}", ephemeral=True)
 
 @bot.tree.command(name="volume", description="Set playback volume (0-100)")
